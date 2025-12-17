@@ -308,7 +308,6 @@ class SymbolTable:
         # Save current offset before entering new scope
         self.offset_stack.append(self.offset_counter)
         self.offset_counter = 12  # Reset offset counter for new scope
-        self.already_warned = set()
 
     def exit_scope(self):
         """Pop the current scope from the stack"""
@@ -397,6 +396,8 @@ class SymbolTable:
                     if not scope:
                         file.write("  (empty)\n")
                     for name, entry in scope.items():
+                        if entry.type == SymbolType.TEMPORARY and not self.debug:
+                            continue
                         file.write(f"  {entry}\n")
                 file.write(f"Snapshot {self.snapshot_counter} end\n\n")  # Add a newline for separation
                 self.snapshot_counter += 1  # Increment snapshot counter
@@ -431,6 +432,7 @@ class Parser:
         self.code_gen = IntermediateCodeGenerator(self)
         self.current_data_type = "int"
         self.param_modes_stack = []
+        self.current_function = None
 
     EXPECTED_IDENTIFIER_ERROR = "Expected identifier"
 
@@ -539,31 +541,6 @@ class Parser:
             return type1 in {'int'} and type2 in {'int'}
             
         return False
-
-    def validate_function_call(self, func_name, args):
-        """Validate a function call against its declaration"""
-        func_entry = self.symbol_table.lookup(func_name)
-        if not func_entry:
-            self.error(f"Undeclared function '{func_name}'")
-        
-        if func_entry.type != SymbolType.FUNCTION:
-            self.error(f"'{func_name}' is not a function")
-        
-        # Check parameter count
-        if len(args) != len(func_entry.parameter_modes):
-            self.error(f"Function '{func_name}' expects {len(func_entry.parameter_modes)} parameters, got {len(args)}")
-        
-        # Check parameter types (if type information is available)
-        for i, (arg, mode) in enumerate(zip(args, func_entry.parameter_modes)):
-            arg_type = self.get_expression_type(arg)
-            param_type = func_entry.parameter_types[i] if hasattr(func_entry, 'parameter_types') else None
-            
-            if param_type and not self.check_type_compatibility(arg_type, param_type):
-                self.error(f"Type mismatch in parameter {i+1} of function '{func_name}'")
-            
-            # Check parameter mode (for in/out parameters)
-            if mode == 'in' and not isinstance(arg, str):
-                self.error(f"Parameter {i+1} of function '{func_name}' must be a variable for input parameter")
 
     def check_return_paths(self, func_name):
         """Check that all code paths in a function return a value"""
@@ -815,7 +792,8 @@ class Parser:
 
     def parse_formalparlist(self):
         """Parse the formal parameter list of a function or procedure"""  
-        self.parse_varlist(False,None,False)
+        if self.current_token.type == TokenType.IDENTIFIER:
+            self.parse_varlist(add=False)
 
     def parse_funcblock(self, func_entry, func_name):
         """Parse the block of a function"""
@@ -829,11 +807,13 @@ class Parser:
                 func_entry.begin_quad = self.code_gen.nextquad()+1
                 # Generate begin_block quad before entering scope
                 self.code_gen.genquad("begin_block", func_name, "_", "_")
+                self.current_function = func_name
                 self.eat(TokenType.KEYWORD)
                 self.parse_sequence()
                 if self.current_token.type == TokenType.KEYWORD and self.current_token.value == "τέλος_συνάρτησης":
                     self.eat(TokenType.KEYWORD)
                     self.check_return_paths(func_name)
+                    self.current_function = None
                 else:
                     self.error("Expected 'τέλος_συνάρτησης'")
             else:
@@ -920,8 +900,9 @@ class Parser:
                 
                 # Enhanced type checking
                 if is_function_return:
-                    if not self.check_type_compatibility(func_entry.data_type, expr_type):
-                        self.error(f"Cannot return {expr_type} from function declared to return {func_entry.data_type}")
+                    if self.current_function != var_name:
+                        self.error("Function return assignment outside function body")
+
                 else:
                     self.check_assignment(var_name, expr_type)
                 
@@ -930,10 +911,13 @@ class Parser:
                 #    entry = self.symbol_table.lookup(var_name)
                 #    if entry:
                 #        entry.value = expr_result
-                
+                if hasattr(self, "for_loop_var") and var_name == self.for_loop_var:
+                    self.error(f"Loop variable '{var_name}' cannot be modified inside for loop")
+
                 if is_function_return:
                     self.code_gen.genquad(":=", expr_result, "", var_name)
                     self.code_gen.genquad("retv", var_name, "", "_")
+                    return
                 else:
                     self.code_gen.genquad(":=", expr_result, "", var_name)
             else:
@@ -1065,6 +1049,8 @@ class Parser:
                 self.validate_function_call(id_name, self.current_token.line, self.current_token.column)
                 
                 func_entry = self.symbol_table.lookup(id_name)
+                if func_entry.type == SymbolType.PROCEDURE:
+                    self.error("Procedure cannot be used as an expression")
                 if not func_entry:
                     self.error(f"Undeclared function '{id_name}'")
                 if func_entry.type not in (SymbolType.FUNCTION, SymbolType.PROCEDURE):
@@ -1139,13 +1125,14 @@ class Parser:
             self.eat(TokenType.OPERATOR)
             if self.current_token.type == TokenType.IDENTIFIER:
                 var_name = self.current_token.value
+                if not self.symbol_table.lookup(var_name):
+                    self.error("REF parameter must be a variable")
                 self.check_declared(var_name)
                 self.eat(TokenType.IDENTIFIER)
                 self.code_gen.genquad("par", var_name, "REF", "_")
         else:
-            var_name = self.current_token.value
-            self.parse_expression()
-            self.code_gen.genquad("par", var_name, "CV", "_")
+            expr = self.parse_expression()
+            self.code_gen.genquad("par", expr, "CV", "_")
 
     def parse_condition(self):
         """Parse a full condition with 'ή' (OR) operations."""
@@ -1206,8 +1193,7 @@ class Parser:
             else:
                 self.error("Expected ']'")
         else:
-            val_name = self.current_token.value
-            self.parse_expression()
+            left = self.parse_expression()
             if self.current_token.type == TokenType.OPERATOR and self.current_token.value in {"=", "<=", ">=", "<>", "<", ">"}:
                 operator = self.current_token.value
                 self.eat(TokenType.OPERATOR)
@@ -1215,7 +1201,7 @@ class Parser:
                 
                 # Generate comparison with variable names instead of literals
                 true_list = self.code_gen.makelist(self.code_gen.nextquad())
-                self.code_gen.genquad(operator, val_name, right, None)  # Use parsed expressions
+                self.code_gen.genquad(operator, left, right, None)
                 
                 false_list = self.code_gen.makelist(self.code_gen.nextquad())
                 self.code_gen.genquad("jump", "_", "_", None)
@@ -1325,9 +1311,9 @@ class Parser:
     def parse_for_stat(self):
         """Parse a for loop."""
         self.eat(TokenType.KEYWORD)  # eat 'για'
-
         if self.current_token.type == TokenType.IDENTIFIER:
             loop_var = self.current_token.value
+            self.for_loop_var = loop_var
             self.eat(TokenType.IDENTIFIER)
 
             if self.current_token.type == TokenType.OPERATOR and self.current_token.value == ":=":
@@ -1348,10 +1334,34 @@ class Parser:
                     # Generate comparison using loop_var instead of literal 1
                     cond_quad = self.code_gen.nextquad()
                     true_list = self.code_gen.makelist(self.code_gen.nextquad())
-                    if step_val < 0:
-                        self.code_gen.genquad(">=", loop_var, end_val, None)
-                    else:
-                        self.code_gen.genquad("<=", loop_var, end_val, None)
+                    
+                    # t = step_val >= 0
+                    t_step_pos = self.code_gen.newtemp()
+                    self.code_gen.genquad(">=", step_val, 0, t_step_pos)
+
+                    # if step >= 0 goto POS
+                    pos_jump = self.code_gen.makelist(self.code_gen.nextquad())
+                    self.code_gen.genquad("jump_if_true", t_step_pos, "_", None)
+
+                    # else NEG
+                    neg_jump = self.code_gen.makelist(self.code_gen.nextquad())
+                    self.code_gen.genquad("jump", "_", "_", None)
+
+                    # POS:
+                    pos_quad = self.code_gen.nextquad()
+                    self.code_gen.backpatch(pos_jump, pos_quad)
+
+                    true_list_pos = self.code_gen.makelist(self.code_gen.nextquad())
+                    self.code_gen.genquad("<=", loop_var, end_val, None)
+
+                    # NEG:
+                    neg_quad = self.code_gen.nextquad()
+                    self.code_gen.backpatch(neg_jump, neg_quad)
+
+                    true_list_neg = self.code_gen.makelist(self.code_gen.nextquad())
+                    self.code_gen.genquad(">=", loop_var, end_val, None)
+
+                    true_list = self.code_gen.merge(true_list_pos, true_list_neg)
 
                     false_list = self.code_gen.makelist(self.code_gen.nextquad())
                     self.code_gen.genquad("jump", "_", "_", None)
@@ -1365,7 +1375,10 @@ class Parser:
                         self.parse_sequence()
 
                         # Step increment
-                        self.code_gen.genquad("+", loop_var, step_val, loop_var)
+                        tmp = self.code_gen.newtemp()
+                        self.code_gen.genquad("+", loop_var, step_val, tmp)
+                        self.code_gen.genquad(":=", tmp, "_", loop_var)
+
 
                         # Jump to condition again
                         self.code_gen.genquad("jump", "_", "_", cond_quad)
@@ -1375,6 +1388,7 @@ class Parser:
 
                         if self.current_token.type == TokenType.KEYWORD and self.current_token.value == "για_τέλος":
                             self.eat(TokenType.KEYWORD)
+                            del self.for_loop_var
                         else:
                             self.error("Expected 'για_τέλος'")
                     else:
@@ -1728,7 +1742,7 @@ class RiscvCodeGenerator:
             # Search all scopes from current outward
             for scope in range(len(self.symbol_table[self.current_snapshot])-1, -1, -1):
                 for entry in self.symbol_table[self.current_snapshot][scope]:
-                    if name in entry.get('name'):
+                    if name == entry.get('name'):
                        return (entry, scope)            
             
         return (None, None)
@@ -1916,6 +1930,8 @@ class RiscvCodeGenerator:
         self.current_function = None
     
     def generate_assignment(self, source, target):
+        if source == target:
+            return
         src_reg = self.get_next_temp_reg()
         if isinstance(source, int):
             self.emit(f"li {src_reg}, {source}")
@@ -1980,20 +1996,51 @@ class RiscvCodeGenerator:
                     else:
                         self.emit(f"lw {reg2}, 0(t0)")
         
-        # Map comparison operators to RISC-V branch instructions
-        branch_op = {
-            '=': 'beq',
-            '<>': 'bne',
-            '<': 'blt',
-            '>': 'bgt',
-            '<=': 'ble',
-            '>=': 'bge'
-        }.get(op)
-        
-        if branch_op:
-            self.emit(f"{branch_op} {reg1}, {reg2}, {self.label_map[int(z)]}")
+        # CASE 1: z is TEMPORARY → boolean result
+        if isinstance(z, str) and z.startswith("T_"):
+            dest = self.get_next_temp_reg()
+
+            if op == "<":
+                self.emit(f"slt {dest}, {reg1}, {reg2}")
+            elif op == ">":
+                self.emit(f"slt {dest}, {reg2}, {reg1}")
+            elif op == "<=":
+                self.emit(f"slt {dest}, {reg2}, {reg1}")
+                self.emit(f"xori {dest}, {dest}, 1")
+            elif op == ">=":
+                self.emit(f"slt {dest}, {reg1}, {reg2}")
+                self.emit(f"xori {dest}, {dest}, 1")
+            elif op == "=":
+                self.emit(f"sub {dest}, {reg1}, {reg2}")
+                self.emit(f"seqz {dest}, {dest}")
+            elif op == "<>":
+                self.emit(f"sub {dest}, {reg1}, {reg2}")
+                self.emit(f"snez {dest}, {dest}")
+            else:
+                raise ValueError(f"Unsupported comparison operation: {op}")
+
+            self.store_value(dest, z)
+            self.free_temp_reg(dest)
+
+        # CASE 2: z is LABEL → branch
         else:
-            raise ValueError(f"Unsupported comparison operation: {op}")
+            label = self.label_map[int(z)]
+
+            if op == "<":
+                self.emit(f"blt {reg1}, {reg2}, {label}")
+            elif op == ">":
+                self.emit(f"bgt {reg1}, {reg2}, {label}")
+            elif op == "<=":
+                self.emit(f"ble {reg1}, {reg2}, {label}")
+            elif op == ">=":
+                self.emit(f"bge {reg1}, {reg2}, {label}")
+            elif op == "=":
+                self.emit(f"beq {reg1}, {reg2}, {label}")
+            elif op == "<>":
+                self.emit(f"bne {reg1}, {reg2}, {label}")
+            else:
+                raise ValueError(f"Unsupported comparison operation: {op}")
+
         
         # Free the registers we used
         self.free_temp_reg(reg1)
@@ -2015,7 +2062,7 @@ class RiscvCodeGenerator:
         
         # Store result
         if target_info['type'] == 'TEMPORARY' or target_info['scope_level'] == self.get_current_scope_level():
-            self.emit(f"sw a0, -{target_info['offset']}(sp)")
+            self.emit(f"sw a0, -{target_info['offset']}(fp)")
         else:
             self.generate_gnlvcode(target)
             self.emit("sw a0, (t0)")
@@ -2097,7 +2144,7 @@ class RiscvCodeGenerator:
                 if value_info:
                     if value_info.get('scope_level') == self.get_current_scope_level():
                         # Local variable - pass address
-                        self.emit(f"addi {reg}, sp, -{value_info['offset']}")
+                       self.emit(f"addi {reg}, fp, -{value_info['offset']}")
                     else:
                         # Non-local variable
                         self.generate_gnlvcode(value)
@@ -2152,11 +2199,11 @@ class RiscvCodeGenerator:
             value_info, sc = self.get_symbol_info(value)
             if value_info:
                 if sc == 0:
-                    self.emit(f"lw {reg}, -{value_info['offset']}(gp)")
+                    self.emit(f"lw {reg}, -{value_info['offset']}(fp)")
                 elif value_info['type'] == 'TEMPORARY' or value_info['scope_level'] == self.get_current_scope_level():
                     # Local variable or temporary
                     if 'offset' in value_info:
-                        self.emit(f"lw {reg}, -{value_info['offset']}(sp)")
+                        self.emit(f"lw {reg}, -{value_info['offset']}(fp)")
                     elif 'value' in value_info:
                         self.emit(f"li {reg}, {value_info['value']}")
                 else:
@@ -2180,11 +2227,8 @@ class RiscvCodeGenerator:
                         addr_reg = self.get_next_temp_reg()
                         self.load_value(target, addr_reg)
                         self.emit(f"sw {reg}, ({addr_reg})")
-                        self.free_temp_reg(addr_reg)
-                        self.free_temp_reg(reg)
                     else:
-                        self.emit(f"sw {reg}, -{target_info['offset']}(sp)")
-                        self.free_temp_reg(reg)
+                        self.emit(f"sw {reg}, -{target_info['offset']}(fp)")
             else:
                 self.generate_gnlvcode(target)
                 self.emit(f"sw {reg}, 0(t0)")
